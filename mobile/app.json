@@ -1,0 +1,91 @@
+{
+  "expo": {
+    "name": "Blaqs",
+    "slug": "blaqs",
+    "scheme": "blaqs",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.blaqs.app",
+      "infoPlist": {
+        "UIBackgroundModes": [
+          "location",
+          "remote-notification"
+        ]
+      }
+    },
+    "android": {
+      "package": "com.blaqs.app",
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "READ_CONTACTS",
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_BACKGROUND_LOCATION",
+        "FOREGROUND_SERVICE",
+        "FOREGROUND_SERVICE_LOCATION",
+        "POST_NOTIFICATIONS"
+      ],
+      "blockedPermissions": [
+        "WRITE_CONTACTS"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-secure-store",
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Blaqs shows your location on the map and shares it only with people you have approved.",
+          "locationAlwaysAndWhenInUsePermission": "Allow \"Always\" so people you approved keep seeing your location when Blaqs is closed. It only runs while you are sharing, and you can pause or stop at any time.",
+          "locationAlwaysPermission": "Allow \"Always\" so people you approved keep seeing your location when Blaqs is closed. It only runs while you are sharing.",
+          "motionUsagePermission": false,
+          "isIosBackgroundLocationEnabled": true,
+          "isAndroidBackgroundLocationEnabled": true,
+          "isAndroidForegroundServiceEnabled": true
+        }
+      ],
+      [
+        "expo-contacts",
+        {
+          "contactsPermission": "Choose who to share your location with. Your contacts stay on your phone; only the number you pick is sent to send the invite."
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "color": "#5B4BFF"
+        }
+      ],
+      [
+        "react-native-maps",
+        {
+          "androidGoogleMapsApiKey": "REPLACE_WITH_GOOGLE_MAPS_API_KEY"
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": true
+    },
+    "extra": {
+      "apiUrl": "http://localhost:4000",
+      "revenueCatIosKey": null,
+      "revenueCatAndroidKey": null,
+      "eas": {
+        "projectId": null
+      }
+    }
+  }
+}

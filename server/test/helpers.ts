@@ -37,7 +37,7 @@ export function setup() {
       get: (url: string) => api.get(url).set('authorization', `Bearer ${token}`),
       post: (url: string, data?: object) => api.post(url).set('authorization', `Bearer ${token}`).send(data ?? {}),
       patch: (url: string, data: object) => api.patch(url).set('authorization', `Bearer ${token}`).send(data),
-      put: (url: string, data: object | null) => api.put(url).set('authorization', `Bearer ${token}`).send(data as object),
+      put: (url: string, data: object) => api.put(url).set('authorization', `Bearer ${token}`).send(data),
       del: (url: string) => api.delete(url).set('authorization', `Bearer ${token}`),
     };
     await as.patch('/me', { pushToken: `ExponentPushToken[${displayName}]` }).expect(200);

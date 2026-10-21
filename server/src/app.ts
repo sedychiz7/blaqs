@@ -43,7 +43,7 @@ const schemas = {
     paused: z.boolean().optional(),
     durationMinutes: duration,
   }),
-  trip: z.object({ label: z.string().min(1).max(80), lat, lng, radiusM: z.number().min(50).max(2000).optional() }).nullable(),
+  trip: z.object({ label: z.string().min(1).max(80), lat, lng, radiusM: z.number().min(50).max(2000).optional() }),
   pauseAll: z.object({ paused: z.boolean() }),
   locations: z.object({
     points: z
@@ -136,6 +136,7 @@ export function createApp(ctx: Context) {
     res.json(shares.updateShare(ctx, req.userId, param(req, 'id'), body(schemas.updateShare, req))),
   );
   app.put('/shares/:id/trip', auth, (req, res) => res.json(shares.setTrip(ctx, req.userId, param(req, 'id'), body(schemas.trip, req))));
+  app.delete('/shares/:id/trip', auth, (req, res) => res.json(shares.setTrip(ctx, req.userId, param(req, 'id'), null)));
 
   // --- Locations --------------------------------------------------------------------------
   app.post('/locations', auth, (req, res) => {

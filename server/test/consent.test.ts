@@ -202,6 +202,10 @@ describe('places, trips and safety', () => {
 
     await alice.post('/locations', { points: [t.point(37.0, -122.0)] });
     expect((await bob.get('/events')).body[0].type).toBe('trip_arrived');
+    expect((await alice.get('/shares')).body[0].trip).toBeNull();
+
+    await alice.put(`/shares/${shareId}/trip`, trip).expect(200);
+    await alice.del(`/shares/${shareId}/trip`).expect(200).then((r) => expect(r.body.trip).toBeNull());
   });
 
   it('SOS reaches everyone with an accepted share, even when paused, and is free', async () => {
