@@ -4,6 +4,8 @@ A minimal AI agent: an LLM in a loop with tools.
 
 ## Tools
 - `read_file` / `write_file`: confined to the `workspace/` folder
+- `web_search` / `fetch_url`: DuckDuckGo search (no API key) and page text fetch. Results are treated as untrusted data.
+- `remember` / `forget`: long-term memory saved to `memory.json` and loaded into the system prompt every step. It lives outside `workspace/` and is gitignored. Edit or delete the file any time to reset.
 - `run_command`: shell command in `workspace/`, **asks for your approval every time**
 
 ## Run (Termux or any machine with Python 3.10+)

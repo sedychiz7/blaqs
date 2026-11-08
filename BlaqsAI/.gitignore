@@ -1,4 +1,5 @@
 workspace/
+memory.json
 .env
 __pycache__/
 *.pyc
