@@ -13,6 +13,7 @@ A minimal AI agent: an LLM in a loop with tools.
 - `generate_report`: builds a markdown report per project straight from `findings.json`, written to `workspace/reports/`. It's assembled by code, not drafted freely by the model, so it can't state anything that wasn't actually logged as a finding — grouped by severity, with a separate "Resolved" section for fixed/false-positive items.
 - `submit_flag` / `list_flags`: for CTF/lab boxes specifically — a one-shot capture, not an ongoing tracked review, so it's a separate log (`ctf_flags.json`) from findings. Rejects a flag already recorded for the same challenge.
 - `binary_info`: fast triage on a binary in the workspace — `file`, `checksec` (if installed), and readable `strings` — before deciding whether to disassemble or debug further.
+- `add_scope_target` / `remove_scope_target` / `list_scope`: the authorized-testing scope, saved to `scope.json`. **Enforced in code**, not just a prompt instruction — `run_command`, `fetch_url`, and `download_file` are blocked if the command/URL references a host/IP that isn't in scope and scope isn't empty.
 
 ## Source review workflow
 To review one of your own apps (SchoolRun, FIF Finder, etc.) rather than scan a
@@ -104,15 +105,35 @@ review:
    flag isn't redone.
 5. Only against a target explicitly named as in scope — never inferred.
 
+## Scope enforcement and audit log
+- **Scope is enforced in code**, not just a system-prompt instruction. Add a
+  target with `add_scope_target` once the user has actually said it's
+  authorized (`fif-finder-staging.example.com`, an HTB IP, etc.). While
+  `scope.json` has entries, `run_command`/`fetch_url`/`download_file` are
+  blocked outright if they reference a host/IP not in it — the model never
+  gets the chance to run them, let alone ask for approval.
+  - An **empty** scope blocks nothing (unconfigured state, not "allow all" —
+    but it does mean nothing's been locked down yet, so set scope early).
+  - Detection is a regex heuristic (IPv4/CIDR, hostnames) over the command
+    text, not a real parser or a network-level control — it catches the
+    obvious case, it isn't a sandbox. `localhost`/`127.0.0.1` are always
+    allowed.
+  - `BLAQS_SCOPE_MODE=warn` allows out-of-scope targets through but still
+    reports them (default is `enforce`).
+- **Every tool call is audited automatically** to `audit.log` (one JSON line
+  per call: timestamp, tool, arguments, result) — no action needed, and no
+  way for the model to skip it, since logging happens in `run_tool` around
+  every dispatch.
+
 ## Safety
 - Step limit (`BLAQS_MAX_STEPS`, default 50) stops runaway loops but gives a real test pass room to enumerate, try things, and adjust
 - File access can't escape `workspace/`
-- Commands need a `y` from you — every time, no "approve all"
-- You decide scope: the agent won't infer a target is fair game on its own, but it has no built-in allowlist either, so stay deliberate about what you approve
+- Commands need a `y` from you — every time, no "approve all" — and are scope-checked before you're even asked
 
 ## Next ideas
-- PDF export of `generate_report`'s markdown output (pandoc or weasyprint)
-- A scope file (`scope.txt`) the agent checks before running anything against an IP/domain
-- Logging every step (and every approved command) to a file
+- Dependency/secret scanner integration (npm audit, pip-audit, gitleaks) as first-class tools instead of ad-hoc shell calls
+- Authenticated-testing scaffolding (stored test credentials, multi-account/IDOR checks)
+- Multi-target/concurrency support and more resilient error handling
+- A real report deliverable: PDF export, executive summary, CVSS-style scoring
 - Background jobs for long scans, with polling instead of a blocking timeout
 - Telegram or WhatsApp front end

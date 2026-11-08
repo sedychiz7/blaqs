@@ -2,6 +2,8 @@ workspace/
 memory.json
 findings.json
 ctf_flags.json
+scope.json
+audit.log
 .env
 __pycache__/
 *.pyc
