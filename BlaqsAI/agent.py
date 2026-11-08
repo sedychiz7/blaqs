@@ -11,7 +11,18 @@ from pathlib import Path
 import anthropic
 import requests
 
-MODEL = os.environ.get("BLAQS_MODEL", "claude-sonnet-5-5")
+try:
+    import openai  # only needed for BLAQS_PROVIDER=ollama/openai — optional otherwise
+except ImportError:
+    openai = None
+
+# "anthropic" (default, needs ANTHROPIC_API_KEY, costs money per token) or
+# "ollama" (free, fully local — needs Ollama running with a tool-calling model
+# pulled) or "openai" (any other OpenAI-compatible endpoint: Groq, OpenRouter
+# free-tier models, etc. — set BLAQS_BASE_URL and BLAQS_API_KEY).
+PROVIDER = os.environ.get("BLAQS_PROVIDER", "anthropic")
+_DEFAULT_MODELS = {"anthropic": "claude-sonnet-5-5", "ollama": "llama3.1", "openai": "gpt-4o-mini"}
+MODEL = os.environ.get("BLAQS_MODEL", _DEFAULT_MODELS.get(PROVIDER, "claude-sonnet-5-5"))
 # Hard stop so the loop can never run away. A real pentest pass (enumerate,
 # try things, read results, adjust) needs more room than a quick Q&A.
 MAX_STEPS = int(os.environ.get("BLAQS_MAX_STEPS", "50"))
@@ -1215,6 +1226,17 @@ TOOLS = [
     },
 ]
 
+# Same tools, OpenAI function-calling shape — for Ollama/Groq/OpenRouter/any
+# OpenAI-compatible endpoint. Converted once here rather than maintaining two
+# parallel tool lists by hand.
+OPENAI_TOOLS = [
+    {
+        "type": "function",
+        "function": {"name": t["name"], "description": t["description"], "parameters": t["input_schema"]},
+    }
+    for t in TOOLS
+]
+
 
 def safe_path(rel: str) -> Path:
     """Resolve a path and refuse anything outside the workspace."""
@@ -1338,23 +1360,62 @@ def _dispatch_tool(name: str, args: dict) -> str:
     return f"unknown tool: {name}"
 
 
+# ---------- provider setup ----------
+def _make_client():
+    if PROVIDER == "anthropic":
+        return anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from the environment
+    if openai is None:
+        raise RuntimeError(
+            "the openai package isn't installed (pip install openai) — "
+            "needed for BLAQS_PROVIDER=ollama or BLAQS_PROVIDER=openai"
+        )
+    if PROVIDER == "ollama":
+        base_url = os.environ.get("BLAQS_BASE_URL", "http://localhost:11434/v1")
+        api_key = os.environ.get("BLAQS_API_KEY", "ollama")  # Ollama ignores this, just needs something present
+    elif PROVIDER == "openai":
+        base_url = os.environ.get("BLAQS_BASE_URL")
+        if not base_url:
+            raise RuntimeError(
+                "BLAQS_BASE_URL is required for BLAQS_PROVIDER=openai "
+                "(e.g. https://api.groq.com/openai/v1 or https://openrouter.ai/api/v1)"
+            )
+        api_key = os.environ.get("BLAQS_API_KEY") or os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("BLAQS_API_KEY (or OPENAI_API_KEY) is required for BLAQS_PROVIDER=openai")
+    else:
+        raise RuntimeError(f"unknown BLAQS_PROVIDER: '{PROVIDER}' (use anthropic, ollama, or openai)")
+    return openai.OpenAI(base_url=base_url, api_key=api_key)
+
+
 # ---------- resilience ----------
 _RETRYABLE_STATUS = {429, 500, 502, 503, 529}  # rate limit, server error, overloaded
 
 
-def _call_with_retries(client: anthropic.Anthropic, max_retries: int = 5, **kwargs):
+def _is_retryable_error(e: Exception) -> bool:
+    if isinstance(e, (anthropic.RateLimitError, anthropic.APIConnectionError)):
+        return True
+    if isinstance(e, anthropic.APIStatusError):
+        return getattr(e, "status_code", None) in _RETRYABLE_STATUS
+    if openai is not None:
+        if isinstance(e, (openai.RateLimitError, openai.APIConnectionError)):
+            return True
+        if isinstance(e, openai.APIStatusError):
+            return getattr(e, "status_code", None) in _RETRYABLE_STATUS
+    return False
+
+
+def _call_with_retries(fn, max_retries: int = 5):
     """Exponential backoff on transient API errors (rate limit, connection
-    drop, server overload). A 4xx that isn't a rate limit is a real problem
-    with the request, not something retrying fixes, so that's raised as-is."""
+    drop, server overload), for either provider. A 4xx that isn't a rate
+    limit is a real problem with the request, not something retrying fixes,
+    so that's raised as-is."""
     delay = 1.0
     last_err = None
     for attempt in range(max_retries + 1):
         try:
-            return client.messages.create(**kwargs)
-        except (anthropic.RateLimitError, anthropic.APIConnectionError) as e:
-            last_err = e
-        except anthropic.APIStatusError as e:
-            if getattr(e, "status_code", None) not in _RETRYABLE_STATUS:
+            return fn()
+        except Exception as e:
+            if not _is_retryable_error(e):
                 raise
             last_err = e
         if attempt == max_retries:
@@ -1371,9 +1432,12 @@ def _serialize_content(content) -> list:
 def save_history(messages: list) -> None:
     """Persisted after every step so a crash mid-run (long pentest passes are
     exactly where that's likely) doesn't lose the conversation — resume with
-    BLAQS_RESUME=1."""
+    BLAQS_RESUME=1. Only Anthropic's content is ever a list of SDK objects
+    needing serialization; OpenAI-style messages (str/None content, plus
+    extra keys like tool_calls/tool_call_id) are already plain and are kept
+    as-is rather than rebuilt, so nothing on them gets silently dropped."""
     serializable = [
-        m if isinstance(m["content"], str) else {"role": m["role"], "content": _serialize_content(m["content"])}
+        {**m, "content": _serialize_content(m["content"])} if isinstance(m.get("content"), list) else m
         for m in messages
     ]
     HISTORY_FILE.write_text(json.dumps(serializable, indent=2))
@@ -1386,21 +1450,19 @@ def load_history() -> list:
         return []
 
 
-def run_agent(task: str, history: list | None = None) -> list:
-    client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from the environment
+def _run_agent_anthropic(client, task: str, history: list | None) -> list:
     messages = history or []
     messages.append({"role": "user", "content": task})
     save_history(messages)
 
     for _ in range(MAX_STEPS):
-        resp = _call_with_retries(
-            client,
+        resp = _call_with_retries(lambda: client.messages.create(
             model=MODEL,
             max_tokens=2048,
             system=build_system_prompt(),  # rebuilt each step so new memories apply
             tools=TOOLS,
             messages=messages,
-        )
+        ))
         messages.append({"role": "assistant", "content": resp.content})
         save_history(messages)
 
@@ -1429,8 +1491,59 @@ def run_agent(task: str, history: list | None = None) -> list:
     return messages
 
 
+def _run_agent_openai_compat(client, task: str, history: list | None) -> list:
+    """Ollama or any other OpenAI-compatible endpoint. The system prompt is
+    rebuilt fresh and prepended each call rather than stored in history, same
+    as the Anthropic path — keeps history.json free of duplicated prompts."""
+    messages = history or []
+    messages.append({"role": "user", "content": task})
+    save_history(messages)
+
+    for _ in range(MAX_STEPS):
+        full_messages = [{"role": "system", "content": build_system_prompt()}] + messages
+        resp = _call_with_retries(lambda: client.chat.completions.create(
+            model=MODEL,
+            max_tokens=2048,
+            messages=full_messages,
+            tools=OPENAI_TOOLS,
+        ))
+        msg = resp.choices[0].message
+        assistant_entry = {"role": "assistant", "content": msg.content}
+        if msg.tool_calls:
+            assistant_entry["tool_calls"] = [tc.model_dump() for tc in msg.tool_calls]
+        messages.append(assistant_entry)
+        save_history(messages)
+
+        if msg.content and msg.content.strip():
+            print(f"\nBlaqsAI: {msg.content}")
+
+        if not msg.tool_calls:
+            return messages
+
+        for tc in msg.tool_calls:
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except json.JSONDecodeError:
+                result = f"error: model sent invalid JSON arguments: {tc.function.arguments!r}"
+            else:
+                print(f"  -> {tc.function.name}({args})")
+                result = run_tool(tc.function.name, args)
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+        save_history(messages)
+
+    print("\n[stopped: reached MAX_STEPS]")
+    return messages
+
+
+def run_agent(task: str, history: list | None = None) -> list:
+    client = _make_client()
+    if PROVIDER == "anthropic":
+        return _run_agent_anthropic(client, task, history)
+    return _run_agent_openai_compat(client, task, history)
+
+
 if __name__ == "__main__":
-    print("BlaqsAI ready. Type a task, or 'exit' to quit.")
+    print(f"BlaqsAI ready (provider: {PROVIDER}, model: {MODEL}). Type a task, or 'exit' to quit.")
     history: list = []
     if os.environ.get("BLAQS_RESUME") == "1":
         history = load_history()

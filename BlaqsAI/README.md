@@ -69,6 +69,64 @@ export ANTHROPIC_API_KEY=your-key-here
 python agent.py
 ```
 
+By default BlaqsAI uses the Anthropic API (`claude-sonnet-5-5`), which costs
+money per request. See "LLM provider / running for free" below to swap in a
+free or fully local model instead — none of the tools, scope enforcement,
+findings pipeline, or audit log change; only the model behind the agent loop
+changes.
+
+## LLM provider / running for free
+BlaqsAI talks to its model through a small provider layer, selected with the
+`BLAQS_PROVIDER` env var. Three options:
+
+### `anthropic` (default) — paid, most reliable tool use
+```bash
+export BLAQS_PROVIDER=anthropic   # or just leave it unset
+export ANTHROPIC_API_KEY=your-key-here
+python agent.py
+```
+
+### `ollama` — free, fully local, no API key, no internet required
+Runs entirely on your own machine via [Ollama](https://ollama.com).
+```bash
+# one-time setup
+curl -fsSL https://ollama.com/install.sh | sh
+ollama pull llama3.1          # or qwen2.5, mistral-nemo, firefunction-v2 —
+                               # pick a model that explicitly supports tool/
+                               # function calling; plain chat models will not
+                               # reliably emit tool_calls
+ollama serve &                 # if not already running as a service
+
+export BLAQS_PROVIDER=ollama
+export BLAQS_MODEL=llama3.1    # optional, this is the default for this provider
+python agent.py
+```
+Ollama exposes an OpenAI-compatible endpoint at `http://localhost:11434/v1` by
+default — BlaqsAI talks to it with the `openai` SDK and no API key is needed.
+Override the endpoint with `BLAQS_BASE_URL` if Ollama is running elsewhere
+(e.g. another machine on your LAN).
+
+### `openai` — any OpenAI-compatible endpoint (free-tier cloud options)
+For a free-tier hosted alternative instead of local inference — e.g.
+[Groq](https://console.groq.com) or [OpenRouter](https://openrouter.ai), both
+of which offer free API keys and OpenAI-compatible endpoints:
+```bash
+export BLAQS_PROVIDER=openai
+export BLAQS_BASE_URL=https://api.groq.com/openai/v1   # or openrouter.ai/api/v1, etc.
+export BLAQS_API_KEY=your-free-tier-key
+export BLAQS_MODEL=llama-3.3-70b-versatile              # pick a tool-calling-capable model offered by that provider
+python agent.py
+```
+
+**Reality check:** smaller/free/local models are noticeably less reliable at
+multi-step tool calling than Claude — expect more malformed tool calls, more
+steps wasted re-reading its own state, and occasional loops where it forgets
+to call a tool it just said it would use. For anything you're relying on
+(a real pentest before a Play Store submission, say), the Anthropic provider
+is still the dependable default; treat the free providers as good for
+low-stakes exploration, learning the tool surface, or offline/no-internet
+use, not as a drop-in replacement for serious engagements.
+
 ## Mobile app (APK/IPA) review workflow
 Different shape from a web app or source repo — no running server to scan, no
 git clone:
