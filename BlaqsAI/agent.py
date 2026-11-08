@@ -52,6 +52,9 @@ BASE_PROMPT = (
     "5. Before starting a review, call `list_findings` for that project so you "
     "don't re-report what's already tracked, and check whether past findings "
     "still reproduce.\n"
+    "6. When the user wants a writeup, call `generate_report` rather than "
+    "composing one yourself — it's built straight from logged findings, so it "
+    "can't state anything that wasn't actually recorded.\n"
     "Findings are evidence-based: log what you actually observed in the code "
     "or a tool's output, not a guess at what might be wrong."
 )
@@ -153,6 +156,63 @@ def list_findings(args: dict) -> str:
             + (f"\n    evidence: {f['evidence']}" if f.get("evidence") else "")
         )
     return "\n".join(lines)
+
+
+# ---------- reporting ----------
+def generate_report(project: str) -> str:
+    """Build a markdown report straight from findings.json — every line in it
+    traces back to a logged finding, never to the model's free text, so the
+    report can't claim something that wasn't actually recorded."""
+    items = [f for f in load_findings() if f["project"] == project]
+    if not items:
+        return f"error: no findings logged for project '{project}'"
+
+    counts = {s: 0 for s in SEVERITIES}
+    for f in items:
+        if f["status"] in ("open", "accepted"):
+            counts[f["severity"]] += 1
+    open_total = sum(counts.values())
+    fixed_total = sum(1 for f in items if f["status"] == "fixed")
+    fp_total = sum(1 for f in items if f["status"] == "false_positive")
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    lines = [
+        f"# Security review — {project}",
+        f"Generated: {now.strftime('%Y-%m-%d %H:%M UTC')}",
+        "",
+        "## Summary",
+        f"- Open/accepted: {open_total} ({', '.join(f'{c} {s}' for s, c in counts.items() if c)})",
+        f"- Fixed: {fixed_total}",
+        f"- False positives: {fp_total}",
+        f"- Total logged: {len(items)}",
+        "",
+    ]
+
+    for severity in SEVERITIES:
+        group = [f for f in items if f["severity"] == severity and f["status"] in ("open", "accepted")]
+        if not group:
+            continue
+        lines.append(f"## {severity.upper()}")
+        for f in group:
+            lines.append(f"### [{f['id']}] {f['title']} ({f['status']})")
+            lines.append(f["description"])
+            if f.get("evidence"):
+                lines.append(f"\n**Evidence:** `{f['evidence']}`")
+            lines.append("")
+
+    resolved = [f for f in items if f["status"] in ("fixed", "false_positive")]
+    if resolved:
+        lines.append("## Resolved")
+        for f in resolved:
+            lines.append(f"- [{f['id']}] ({f['severity']}, {f['status']}) {f['title']}")
+        lines.append("")
+
+    report_md = "\n".join(lines)
+    out_dir = WORKDIR / "reports"
+    out_dir.mkdir(exist_ok=True)
+    out_path = out_dir / f"{project}_{now.strftime('%Y%m%d_%H%M%S')}.md"
+    out_path.write_text(report_md)
+    return f"wrote report to {out_path.relative_to(WORKDIR)} ({open_total} open, {fixed_total} fixed, {fp_total} false positive)"
 
 
 # ---------- web ----------
@@ -319,6 +379,20 @@ TOOLS = [
         },
     },
     {
+        "name": "generate_report",
+        "description": (
+            "Build a markdown report for a project from its logged findings "
+            "(findings.json), written to workspace/reports/. The report is "
+            "assembled directly from findings data, not drafted freely, so "
+            "it only ever states what's actually been logged."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"project": {"type": "string"}},
+            "required": ["project"],
+        },
+    },
+    {
         "name": "run_command",
         "description": "Run a shell command in the workspace. The user must approve it first.",
         "input_schema": {
@@ -372,6 +446,8 @@ def run_tool(name: str, args: dict) -> str:
             return update_finding_status(args)
         if name == "list_findings":
             return list_findings(args)
+        if name == "generate_report":
+            return generate_report(args["project"])
         if name == "run_command":
             cmd = args["command"]
             if input(f"\n[approve command?] {cmd}\n(y/N): ").strip().lower() != "y":
