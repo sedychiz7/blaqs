@@ -170,6 +170,9 @@ review:
     text, not a real parser or a network-level control — it catches the
     obvious case, it isn't a sandbox. `localhost`/`127.0.0.1` are always
     allowed.
+  - A CIDR scope entry (`10.10.10.0/24`) does real subnet containment via
+    Python's `ipaddress` module — individual IPs and narrower sub-CIDRs
+    inside the range are in scope, anything outside it isn't.
   - `BLAQS_SCOPE_MODE=warn` allows out-of-scope targets through but still
     reports them (default is `enforce`).
 - **Every tool call is audited automatically** to `audit.log` (one JSON line

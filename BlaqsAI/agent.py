@@ -1,6 +1,7 @@
 """BlaqsAI - a minimal AI agent: an LLM in a loop with tools."""
 
 import datetime
+import ipaddress
 import json
 import os
 import re
@@ -634,9 +635,28 @@ def extract_targets(command: str) -> set[str]:
 def _target_in_scope(target: str, scope_entries: list[str]) -> bool:
     target = target.lower()
     for entry in scope_entries:
+        entry = entry.lower()
         if target == entry:
             return True
-        if "/" in entry:  # CIDR scope entry — exact IP match only (no ipaddress-module subnet math here)
+        if "/" in entry:
+            # CIDR scope entry — real subnet containment via the ipaddress
+            # module, not string matching. Covers both a plain IP target
+            # inside the range and a (sub)CIDR target nested inside it.
+            try:
+                network = ipaddress.ip_network(entry, strict=False)
+            except ValueError:
+                continue  # malformed scope entry, not our problem here
+            try:
+                if "/" in target:
+                    candidate = ipaddress.ip_network(target, strict=False)
+                    if candidate.version == network.version and candidate.subnet_of(network):
+                        return True
+                else:
+                    address = ipaddress.ip_address(target)
+                    if address.version == network.version and address in network:
+                        return True
+            except ValueError:
+                continue  # target isn't actually an IP/CIDR (e.g. a hostname) — skip
             continue
         if target.endswith("." + entry):  # subdomain of a scoped domain
             return True
