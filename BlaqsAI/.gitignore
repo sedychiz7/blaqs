@@ -1,6 +1,7 @@
 workspace/
 memory.json
 findings.json
+ctf_flags.json
 .env
 __pycache__/
 *.pyc

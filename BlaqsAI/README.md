@@ -11,6 +11,8 @@ A minimal AI agent: an LLM in a loop with tools.
 - `list_dir` / `search_code`: browse and grep source under `workspace/`, for reviewing a cloned app's code rather than reading files blind.
 - `add_finding` / `update_finding_status` / `list_findings`: a findings log, saved to `findings.json` outside the workspace. Each finding has a project, title, severity (critical/high/medium/low/info), description, evidence, and status (open/fixed/accepted/false_positive). Open findings are summarized in the system prompt every step, so the agent doesn't re-report what's already tracked.
 - `generate_report`: builds a markdown report per project straight from `findings.json`, written to `workspace/reports/`. It's assembled by code, not drafted freely by the model, so it can't state anything that wasn't actually logged as a finding — grouped by severity, with a separate "Resolved" section for fixed/false-positive items.
+- `submit_flag` / `list_flags`: for CTF/lab boxes specifically — a one-shot capture, not an ongoing tracked review, so it's a separate log (`ctf_flags.json`) from findings. Rejects a flag already recorded for the same challenge.
+- `binary_info`: fast triage on a binary in the workspace — `file`, `checksec` (if installed), and readable `strings` — before deciding whether to disassemble or debug further.
 
 ## Source review workflow
 To review one of your own apps (SchoolRun, FIF Finder, etc.) rather than scan a
@@ -87,6 +89,20 @@ git clone:
    proxy like mitmproxy or Burp between the test device and the network is
    the real way to see it — this agent doesn't automate that part.
 5. `add_finding` / `generate_report` as usual.
+
+## CTF / lab box workflow (HTB, picoCTF, etc.)
+Different again from reviewing your own apps — one-shot, not an ongoing tracked
+review:
+1. Recon/exploit as usual via `run_command` (nmap, metasploit, whatever's installed).
+2. For a binary challenge, `download_file` or pull it over, then `binary_info`
+   for a fast first look before reaching for a disassembler/debugger.
+3. Exploit dev against a binary (crafting a payload, reading an offset back,
+   adjusting) is iterative — expect repeated `run_command` calls using whatever
+   of pwntools/gdb+gdb-peda or pwndbg/ROPgadget/radare2/Ghidra (headless) is
+   installed.
+4. `submit_flag` once captured. `list_flags` first if resuming, so a captured
+   flag isn't redone.
+5. Only against a target explicitly named as in scope — never inferred.
 
 ## Safety
 - Step limit (`BLAQS_MAX_STEPS`, default 50) stops runaway loops but gives a real test pass room to enumerate, try things, and adjust

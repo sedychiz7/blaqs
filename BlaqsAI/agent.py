@@ -20,6 +20,7 @@ WORKDIR.mkdir(parents=True, exist_ok=True)
 # Memory and findings live OUTSIDE the workspace so file tools can't tamper with them.
 MEMORY_FILE = Path(os.environ.get("BLAQS_MEMORY", "./memory.json")).resolve()
 FINDINGS_FILE = Path(os.environ.get("BLAQS_FINDINGS", "./findings.json")).resolve()
+FLAGS_FILE = Path(os.environ.get("BLAQS_FLAGS", "./ctf_flags.json")).resolve()
 SEVERITIES = ("critical", "high", "medium", "low", "info")
 STATUSES = ("open", "fixed", "accepted", "false_positive")
 
@@ -75,7 +76,25 @@ BASE_PROMPT = (
     "4. For runtime behavior (API calls, auth tokens, what the app actually "
     "sends), a proxy like mitmproxy or Burp sitting between the test device "
     "and the network is the real way to see it — note if not installed.\n"
-    "5. Log and report findings exactly as with a web app."
+    "5. Log and report findings exactly as with a web app.\n\n"
+    "A CTF challenge or lab box (Hack The Box, etc.) is a different shape of "
+    "task again — one-shot, not an ongoing tracked review:\n"
+    "- Use `submit_flag` when you capture a flag, not `add_finding`/"
+    "`generate_report` — those are for reviewing the user's own apps over "
+    "time, not a single capture-the-flag goal.\n"
+    "- Call `list_flags` for the challenge before starting, so a resumed "
+    "session doesn't redo work on a flag already captured.\n"
+    "- For binary/pwn/reversing challenges, use `binary_info` on a downloaded "
+    "file for a fast first look (file type, security mitigations, readable "
+    "strings) before deciding whether to disassemble/debug further.\n"
+    "- Exploit development on a binary (crafting and testing a payload, "
+    "reading an offset back, adjusting) is inherently iterative — expect to "
+    "use `run_command` repeatedly with tools like pwntools, gdb (with "
+    "gdb-peda/pwndbg), ROPgadget, or radare2/Ghidra in headless/script mode; "
+    "check what's installed with `which` rather than assuming a full pwn "
+    "toolchain is present.\n"
+    "- Only against targets explicitly in scope: a named HTB/CTF machine or "
+    "challenge, never inferred."
 )
 
 
@@ -107,6 +126,13 @@ def build_system_prompt() -> str:
             for proj, items in by_project.items()
         )
         prompt += f"\n\nOpen findings by project (call list_findings for detail):\n{lines}"
+    flags = load_flags()
+    if flags:
+        challenges = sorted({f["challenge"] for f in flags})
+        prompt += (
+            "\n\nFlags already captured for: " + ", ".join(challenges)
+            + " (call list_flags for detail — don't redo a captured flag)."
+        )
     return prompt
 
 
@@ -232,6 +258,76 @@ def generate_report(project: str) -> str:
     out_path = out_dir / f"{project}_{now.strftime('%Y%m%d_%H%M%S')}.md"
     out_path.write_text(report_md)
     return f"wrote report to {out_path.relative_to(WORKDIR)} ({open_total} open, {fixed_total} fixed, {fp_total} false positive)"
+
+
+# ---------- CTF flags ----------
+def load_flags() -> list[dict]:
+    try:
+        return json.loads(FLAGS_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def save_flags(items: list[dict]) -> None:
+    FLAGS_FILE.write_text(json.dumps(items, indent=2))
+
+
+def submit_flag(args: dict) -> str:
+    items = load_flags()
+    if any(f["challenge"] == args["challenge"] and f["flag"] == args["flag"] for f in items):
+        return "already recorded — this flag was already captured for this challenge"
+    items.append(
+        {
+            "id": max((f["id"] for f in items), default=0) + 1,
+            "challenge": args["challenge"],
+            "flag": args["flag"],
+            "notes": args.get("notes", ""),
+            "captured_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+    )
+    save_flags(items)
+    return f"recorded flag for '{args['challenge']}': {args['flag']}"
+
+
+def list_flags(challenge: str | None) -> str:
+    items = load_flags()
+    if challenge:
+        items = [f for f in items if f["challenge"] == challenge]
+    if not items:
+        return "no flags recorded"
+    return "\n".join(
+        f"[{f['id']}] {f['challenge']}: {f['flag']}" + (f" — {f['notes']}" if f.get("notes") else "")
+        for f in items
+    )
+
+
+# ---------- binary triage ----------
+def binary_info(rel: str) -> str:
+    """Fast first look at a binary — file type, readable strings, and a
+    mitigations check if checksec is available — before deciding whether to
+    disassemble or debug further."""
+    p = safe_path(rel)
+    if not p.is_file():
+        return f"error: {rel} is not a file"
+
+    sections = []
+    r = subprocess.run(["file", str(p)], capture_output=True, text=True, timeout=15)
+    sections.append("## file\n" + r.stdout.strip())
+
+    if subprocess.run(["which", "checksec"], capture_output=True).returncode == 0:
+        r = subprocess.run(["checksec", "--file=" + str(p)], capture_output=True, text=True, timeout=15)
+        sections.append("## checksec\n" + (r.stdout.strip() or r.stderr.strip()))
+    else:
+        sections.append("## checksec\n(not installed)")
+
+    r = subprocess.run(["strings", "-n", "8", str(p)], capture_output=True, text=True, timeout=30)
+    strings_out = r.stdout.strip()
+    lines = strings_out.splitlines()
+    sections.append(
+        "## strings (first 60 of {} lines, min length 8)\n".format(len(lines))
+        + "\n".join(lines[:60])
+    )
+    return "\n\n".join(sections)[:20000]
 
 
 # ---------- web ----------
@@ -450,6 +546,45 @@ TOOLS = [
         },
     },
     {
+        "name": "submit_flag",
+        "description": (
+            "Record a captured CTF/lab flag. Use this for one-shot "
+            "capture-the-flag goals, not add_finding/generate_report, which "
+            "are for ongoing app-review tracking."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "challenge": {"type": "string", "description": "e.g. 'HTB - Lame' or 'picoCTF - buffer overflow 1'"},
+                "flag": {"type": "string"},
+                "notes": {"type": "string", "description": "Optional: how it was obtained"},
+            },
+            "required": ["challenge", "flag"],
+        },
+    },
+    {
+        "name": "list_flags",
+        "description": "List previously captured flags, optionally filtered by challenge.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"challenge": {"type": "string"}},
+            "required": [],
+        },
+    },
+    {
+        "name": "binary_info",
+        "description": (
+            "Fast first-look triage on a binary in the workspace: file type, "
+            "security mitigations (checksec, if installed), and readable "
+            "strings. Use before deciding whether to disassemble/debug further."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"path": {"type": "string", "description": "Relative path to the binary"}},
+            "required": ["path"],
+        },
+    },
+    {
         "name": "run_command",
         "description": "Run a shell command in the workspace. The user must approve it first.",
         "input_schema": {
@@ -507,6 +642,12 @@ def run_tool(name: str, args: dict) -> str:
             return list_findings(args)
         if name == "generate_report":
             return generate_report(args["project"])
+        if name == "submit_flag":
+            return submit_flag(args)
+        if name == "list_flags":
+            return list_flags(args.get("challenge"))
+        if name == "binary_info":
+            return binary_info(args["path"])
         if name == "run_command":
             cmd = args["command"]
             if input(f"\n[approve command?] {cmd}\n(y/N): ").strip().lower() != "y":
