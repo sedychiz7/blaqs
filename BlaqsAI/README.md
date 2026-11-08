@@ -5,6 +5,7 @@ A minimal AI agent: an LLM in a loop with tools.
 ## Tools
 - `read_file` / `write_file`: confined to the `workspace/` folder
 - `web_search` / `fetch_url`: DuckDuckGo search (no API key) and page text fetch. Results are treated as untrusted data.
+- `download_file`: saves a URL's raw bytes into the workspace — for APKs, binaries, or anything `fetch_url`'s HTML-to-text pass would mangle. Capped at 200MB by default (`BLAQS_MAX_DOWNLOAD_MB`); a partial file is deleted if the cap is hit mid-download.
 - `remember` / `forget`: long-term memory saved to `memory.json` and loaded into the system prompt every step. It lives outside `workspace/` and is gitignored. Edit or delete the file any time to reset.
 - `run_command`: shell command in `workspace/`, **asks for your approval every time**. There's no per-utility tool for nmap, sqlmap, etc. — `run_command` is a shell, so anything already installed on the machine BlaqsAI runs on is reachable through it.
 - `list_dir` / `search_code`: browse and grep source under `workspace/`, for reviewing a cloned app's code rather than reading files blind.
@@ -71,8 +72,24 @@ it just reuses whatever SSH access you already have set up.
 
 Leave `BLAQS_KALI_HOST` unset to disable the tool entirely.
 
+## Mobile app (APK/IPA) review workflow
+Different shape from a web app or source repo — no running server to scan, no
+git clone:
+1. `download_file` if there's a direct APK link, or `adb pull` / `adb shell pm
+   path <package>` via `run_command` for a connected test device.
+2. Decompile before reading: `apktool d` for the manifest/resources, `jadx`
+   for readable Java/Kotlin. The agent checks with `which` first rather than
+   assuming either is installed.
+3. `search_code` / `list_dir` on the decompiled output, same as a cloned repo —
+   looking for hardcoded secrets, insecure local storage, missing certificate
+   pinning, exported components, cleartext traffic allowed.
+4. For runtime behavior (what the app actually sends over the network), a
+   proxy like mitmproxy or Burp between the test device and the network is
+   the real way to see it — this agent doesn't automate that part.
+5. `add_finding` / `generate_report` as usual.
+
 ## Safety
-- Step limit (`MAX_STEPS = 15`) stops runaway loops
+- Step limit (`BLAQS_MAX_STEPS`, default 50) stops runaway loops but gives a real test pass room to enumerate, try things, and adjust
 - File access can't escape `workspace/`
 - Commands need a `y` from you — every time, no "approve all"
 - You decide scope: the agent won't infer a target is fair game on its own, but it has no built-in allowlist either, so stay deliberate about what you approve

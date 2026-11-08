@@ -11,7 +11,9 @@ import anthropic
 import requests
 
 MODEL = os.environ.get("BLAQS_MODEL", "claude-sonnet-5-5")
-MAX_STEPS = 15          # hard stop so the loop can never run away
+# Hard stop so the loop can never run away. A real pentest pass (enumerate,
+# try things, read results, adjust) needs more room than a quick Q&A.
+MAX_STEPS = int(os.environ.get("BLAQS_MAX_STEPS", "50"))
 COMMAND_TIMEOUT = int(os.environ.get("BLAQS_COMMAND_TIMEOUT", "600"))
 WORKDIR = Path(os.environ.get("BLAQS_WORKDIR", "./workspace")).resolve()
 WORKDIR.mkdir(parents=True, exist_ok=True)
@@ -56,7 +58,24 @@ BASE_PROMPT = (
     "composing one yourself — it's built straight from logged findings, so it "
     "can't state anything that wasn't actually recorded.\n"
     "Findings are evidence-based: log what you actually observed in the code "
-    "or a tool's output, not a guess at what might be wrong."
+    "or a tool's output, not a guess at what might be wrong.\n\n"
+    "For a mobile app (APK/IPA), source review and recon don't apply the same "
+    "way — work like this instead:\n"
+    "1. Get the APK into the workspace: `download_file` if there's a direct "
+    "link, or `adb pull`/`adb shell pm path <package>` via run_command if it's "
+    "on a connected test device.\n"
+    "2. Decompile before reading: `apktool d` for resources/manifest, `jadx` "
+    "for readable Java/Kotlin source. Check they're installed first (`which`) "
+    "rather than assuming — if missing, say so instead of guessing at output.\n"
+    "3. Use `search_code`/`list_dir` on the decompiled output the same way as "
+    "a cloned repo: look for hardcoded API keys/secrets, insecure storage "
+    "(SharedPreferences, plaintext files), weak or missing certificate "
+    "pinning, exported components in the manifest, and cleartext network "
+    "traffic allowed (usesCleartextTraffic, missing network_security_config).\n"
+    "4. For runtime behavior (API calls, auth tokens, what the app actually "
+    "sends), a proxy like mitmproxy or Burp sitting between the test device "
+    "and the network is the real way to see it — note if not installed.\n"
+    "5. Log and report findings exactly as with a web app."
 )
 
 
@@ -237,6 +256,29 @@ def fetch_url(url: str) -> str:
     return re.sub(r"\s+", " ", text).strip()[:15000]
 
 
+MAX_DOWNLOAD_BYTES = int(os.environ.get("BLAQS_MAX_DOWNLOAD_MB", "200")) * 1024 * 1024
+
+
+def download_file(url: str, rel_path: str) -> str:
+    """Save a URL's raw bytes into the workspace — for APKs, binaries, or
+    anything else fetch_url's text-stripping would mangle."""
+    if not url.startswith(("http://", "https://")):
+        return "error: only http(s) URLs are allowed"
+    out_path = safe_path(rel_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with requests.get(url, stream=True, timeout=60, headers={"User-Agent": "BlaqsAI/0.1"}) as r:
+        r.raise_for_status()
+        written = 0
+        with open(out_path, "wb") as fh:
+            for chunk in r.iter_content(chunk_size=65536):
+                written += len(chunk)
+                if written > MAX_DOWNLOAD_BYTES:
+                    out_path.unlink(missing_ok=True)
+                    return f"error: exceeded {MAX_DOWNLOAD_BYTES // (1024*1024)}MB download limit"
+                fh.write(chunk)
+    return f"saved {written} bytes to {rel_path}"
+
+
 # ---------- source review ----------
 def list_dir(rel: str) -> str:
     p = safe_path(rel)
@@ -294,6 +336,21 @@ TOOLS = [
             "type": "object",
             "properties": {"url": {"type": "string"}},
             "required": ["url"],
+        },
+    },
+    {
+        "name": "download_file",
+        "description": (
+            "Download a URL's raw bytes into the workspace (an APK, a binary, "
+            "any file fetch_url's HTML-to-text conversion would mangle)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string"},
+                "path": {"type": "string", "description": "Relative path to save to"},
+            },
+            "required": ["url", "path"],
         },
     },
     {
@@ -425,6 +482,8 @@ def run_tool(name: str, args: dict) -> str:
             return web_search(args["query"])
         if name == "fetch_url":
             return fetch_url(args["url"])
+        if name == "download_file":
+            return download_file(args["url"], args["path"])
         if name == "remember":
             items = load_memory()
             new_id = max((m["id"] for m in items), default=0) + 1
