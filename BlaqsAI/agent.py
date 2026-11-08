@@ -5,6 +5,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 
 import anthropic
@@ -23,6 +24,8 @@ FINDINGS_FILE = Path(os.environ.get("BLAQS_FINDINGS", "./findings.json")).resolv
 FLAGS_FILE = Path(os.environ.get("BLAQS_FLAGS", "./ctf_flags.json")).resolve()
 SCOPE_FILE = Path(os.environ.get("BLAQS_SCOPE", "./scope.json")).resolve()
 AUDIT_FILE = Path(os.environ.get("BLAQS_AUDIT", "./audit.log")).resolve()
+CREDENTIALS_FILE = Path(os.environ.get("BLAQS_CREDENTIALS", "./credentials.json")).resolve()
+HISTORY_FILE = Path(os.environ.get("BLAQS_HISTORY", "./history.json")).resolve()
 # "enforce" (default): block any shell command that references a target not
 # in scope. "warn": allow but flag. Only matters once scope.json has entries —
 # an empty scope list means nothing has been defined yet, so nothing is blocked.
@@ -66,9 +69,19 @@ BASE_PROMPT = (
     "5. Before starting a review, call `list_findings` for that project so you "
     "don't re-report what's already tracked, and check whether past findings "
     "still reproduce.\n"
-    "6. When the user wants a writeup, call `generate_report` rather than "
-    "composing one yourself — it's built straight from logged findings, so it "
-    "can't state anything that wasn't actually recorded.\n"
+    "6. When the user wants a writeup, call `generate_report` (or "
+    "`export_report_pdf` for a PDF) rather than composing one yourself — "
+    "it's built straight from logged findings, so it can't state anything "
+    "that wasn't actually recorded. Add a `cvss` score to a finding when you "
+    "have a real basis for one; it's optional, severity still drives the report.\n"
+    "7. Use `scan_dependencies` and `scan_secrets` on a cloned repo early — "
+    "they log findings automatically from the underlying tool's own output, "
+    "which is more reliable than eyeballing a lockfile or grepping for keys "
+    "yourself.\n"
+    "8. For testing that needs to be logged in as a user (IDOR checks, "
+    "role/permission checks across accounts), use `add_credential`/"
+    "`get_credential` for your own test accounts — never a real user's "
+    "credentials. `list_credentials` never shows the secret itself.\n"
     "Findings are evidence-based: log what you actually observed in the code "
     "or a tool's output, not a guess at what might be wrong.\n\n"
     "For a mobile app (APK/IPA), source review and recon don't apply the same "
@@ -169,6 +182,9 @@ def add_finding(args: dict) -> str:
     severity = args["severity"].lower()
     if severity not in SEVERITIES:
         return f"error: severity must be one of {SEVERITIES}"
+    cvss = args.get("cvss")
+    if cvss is not None and not (0.0 <= float(cvss) <= 10.0):
+        return "error: cvss must be between 0.0 and 10.0"
     items = load_findings()
     new_id = max((f["id"] for f in items), default=0) + 1
     items.append(
@@ -179,12 +195,13 @@ def add_finding(args: dict) -> str:
             "severity": severity,
             "description": args["description"],
             "evidence": args.get("evidence", ""),
+            "cvss": float(cvss) if cvss is not None else None,
             "status": "open",
             "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
     )
     save_findings(items)
-    return f"logged finding {new_id} ({severity}): {args['title']}"
+    return f"logged finding {new_id} ({severity}{f', CVSS {cvss}' if cvss is not None else ''}): {args['title']}"
 
 
 def update_finding_status(args: dict) -> str:
@@ -213,14 +230,59 @@ def list_findings(args: dict) -> str:
     lines = []
     for f in items:
         lines.append(
-            f"[{f['id']}] {f['project']} / {f['severity'].upper()} / {f['status']} "
-            f"— {f['title']}\n    {f['description']}"
+            f"[{f['id']}] {f['project']} / {f['severity'].upper()}"
+            + (f" / CVSS {f['cvss']}" if f.get("cvss") is not None else "")
+            + f" / {f['status']} — {f['title']}\n    {f['description']}"
             + (f"\n    evidence: {f['evidence']}" if f.get("evidence") else "")
         )
     return "\n".join(lines)
 
 
 # ---------- reporting ----------
+def _report_stats(items: list[dict]) -> dict:
+    counts = {s: 0 for s in SEVERITIES}
+    for f in items:
+        if f["status"] in ("open", "accepted"):
+            counts[f["severity"]] += 1
+    open_items = [f for f in items if f["status"] in ("open", "accepted")]
+    cvss_scores = [f["cvss"] for f in open_items if f.get("cvss") is not None]
+    return {
+        "counts": counts,
+        "open_total": sum(counts.values()),
+        "fixed_total": sum(1 for f in items if f["status"] == "fixed"),
+        "fp_total": sum(1 for f in items if f["status"] == "false_positive"),
+        "cvss_max": max(cvss_scores) if cvss_scores else None,
+        "cvss_avg": sum(cvss_scores) / len(cvss_scores) if cvss_scores else None,
+    }
+
+
+def _executive_summary(project: str, items: list[dict], stats: dict) -> str:
+    """Templated, not freeform — every number in it traces to _report_stats,
+    so it can't overstate or understate what was actually found."""
+    counts = stats["counts"]
+    open_total = stats["open_total"]
+    if open_total == 0:
+        return (
+            f"This review of {project} found no open issues at the medium severity "
+            f"or above threshold out of {len(items)} finding(s) logged in total. "
+            "See the Resolved section for what was previously identified and addressed."
+        )
+    severity_parts = ", ".join(f"{c} {s}" for s, c in counts.items() if c)
+    urgency = (
+        "Immediate remediation is recommended before release."
+        if counts["critical"] or counts["high"]
+        else "No critical or high severity issues are currently open, but the items "
+        "below should still be addressed before release."
+    )
+    cvss_note = ""
+    if stats["cvss_max"] is not None:
+        cvss_note = f" The highest CVSS score among open findings is {stats['cvss_max']:.1f} (average {stats['cvss_avg']:.1f})."
+    return (
+        f"This review of {project} identified {open_total} open issue(s): {severity_parts}. "
+        f"{urgency}{cvss_note}"
+    )
+
+
 def generate_report(project: str) -> str:
     """Build a markdown report straight from findings.json — every line in it
     traces back to a logged finding, never to the model's free text, so the
@@ -229,26 +291,24 @@ def generate_report(project: str) -> str:
     if not items:
         return f"error: no findings logged for project '{project}'"
 
-    counts = {s: 0 for s in SEVERITIES}
-    for f in items:
-        if f["status"] in ("open", "accepted"):
-            counts[f["severity"]] += 1
-    open_total = sum(counts.values())
-    fixed_total = sum(1 for f in items if f["status"] == "fixed")
-    fp_total = sum(1 for f in items if f["status"] == "false_positive")
-
+    stats = _report_stats(items)
     now = datetime.datetime.now(datetime.timezone.utc)
     lines = [
         f"# Security review — {project}",
         f"Generated: {now.strftime('%Y-%m-%d %H:%M UTC')}",
         "",
-        "## Summary",
-        f"- Open/accepted: {open_total} ({', '.join(f'{c} {s}' for s, c in counts.items() if c)})",
-        f"- Fixed: {fixed_total}",
-        f"- False positives: {fp_total}",
-        f"- Total logged: {len(items)}",
+        "## Executive Summary",
+        _executive_summary(project, items, stats),
         "",
+        "## Summary",
+        f"- Open/accepted: {stats['open_total']} ({', '.join(f'{c} {s}' for s, c in stats['counts'].items() if c)})",
+        f"- Fixed: {stats['fixed_total']}",
+        f"- False positives: {stats['fp_total']}",
+        f"- Total logged: {len(items)}",
     ]
+    if stats["cvss_max"] is not None:
+        lines.append(f"- CVSS (open findings): max {stats['cvss_max']:.1f}, average {stats['cvss_avg']:.1f}")
+    lines.append("")
 
     for severity in SEVERITIES:
         group = [f for f in items if f["severity"] == severity and f["status"] in ("open", "accepted")]
@@ -256,7 +316,8 @@ def generate_report(project: str) -> str:
             continue
         lines.append(f"## {severity.upper()}")
         for f in group:
-            lines.append(f"### [{f['id']}] {f['title']} ({f['status']})")
+            cvss_tag = f" — CVSS {f['cvss']:.1f}" if f.get("cvss") is not None else ""
+            lines.append(f"### [{f['id']}] {f['title']}{cvss_tag} ({f['status']})")
             lines.append(f["description"])
             if f.get("evidence"):
                 lines.append(f"\n**Evidence:** `{f['evidence']}`")
@@ -274,7 +335,109 @@ def generate_report(project: str) -> str:
     out_dir.mkdir(exist_ok=True)
     out_path = out_dir / f"{project}_{now.strftime('%Y%m%d_%H%M%S')}.md"
     out_path.write_text(report_md)
-    return f"wrote report to {out_path.relative_to(WORKDIR)} ({open_total} open, {fixed_total} fixed, {fp_total} false positive)"
+    return (
+        f"wrote report to {out_path.relative_to(WORKDIR)} "
+        f"({stats['open_total']} open, {stats['fixed_total']} fixed, {stats['fp_total']} false positive)"
+    )
+
+
+def export_report_pdf(project: str) -> str:
+    """Builds a PDF directly from findings.json — same data as
+    generate_report, not a re-parse of the markdown, so there's one source
+    of truth. Requires fpdf2 (pip install fpdf2)."""
+    try:
+        from fpdf import FPDF
+    except ImportError:
+        return "error: fpdf2 is not installed (pip install fpdf2), can't export PDF"
+
+    items = [f for f in load_findings() if f["project"] == project]
+    if not items:
+        return f"error: no findings logged for project '{project}'"
+    stats = _report_stats(items)
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    _UNICODE_REPLACEMENTS = {
+        "—": "-", "–": "-",       # em/en dash
+        "‘": "'", "’": "'",       # curly single quotes
+        "“": '"', "”": '"',       # curly double quotes
+        "…": "...",                    # ellipsis
+    }
+
+    def safe(text: str) -> str:
+        """The core PDF font only covers Latin-1, and our own strings use
+        characters like em dash throughout — depending on a system Unicode
+        font would make this work here but not necessarily on the user's
+        actual machine, so sanitize instead. Also forces a break point into
+        long unbroken runs (redacted secrets, etc.) that fpdf2's word-wrap
+        can't otherwise split."""
+        for u, a in _UNICODE_REPLACEMENTS.items():
+            text = text.replace(u, a)
+        text = text.encode("latin-1", "replace").decode("latin-1")
+        return re.sub(r"(\S{40})(?=\S)", r"\1 ", text)
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    def line(h: float, text: str) -> None:
+        # multi_cell in this fpdf2 version leaves the x-cursor wherever the
+        # last line ended rather than resetting to the left margin, so the
+        # next call sees almost no width left and errors out — reset first.
+        pdf.set_x(pdf.l_margin)
+        pdf.multi_cell(0, h, safe(text))
+
+    pdf.set_font("Helvetica", "B", 16)
+    line(10, f"Security review - {project}")
+    pdf.set_font("Helvetica", "", 10)
+    line(6, f"Generated: {now.strftime('%Y-%m-%d %H:%M UTC')}")
+    pdf.ln(4)
+
+    pdf.set_font("Helvetica", "B", 13)
+    line(8, "Executive Summary")
+    pdf.set_font("Helvetica", "", 11)
+    line(6, _executive_summary(project, items, stats))
+    pdf.ln(4)
+
+    pdf.set_font("Helvetica", "B", 13)
+    line(8, "Summary")
+    pdf.set_font("Helvetica", "", 11)
+    counts_line = ", ".join(f"{c} {s}" for s, c in stats["counts"].items() if c) or "none"
+    line(6, f"Open/accepted: {stats['open_total']} ({counts_line})")
+    line(6, f"Fixed: {stats['fixed_total']}   False positives: {stats['fp_total']}   Total logged: {len(items)}")
+    if stats["cvss_max"] is not None:
+        line(6, f"CVSS (open findings): max {stats['cvss_max']:.1f}, average {stats['cvss_avg']:.1f}")
+    pdf.ln(4)
+
+    for severity in SEVERITIES:
+        group = [f for f in items if f["severity"] == severity and f["status"] in ("open", "accepted")]
+        if not group:
+            continue
+        pdf.set_font("Helvetica", "B", 13)
+        line(8, severity.upper())
+        for f in group:
+            pdf.set_font("Helvetica", "B", 11)
+            cvss_tag = f" (CVSS {f['cvss']:.1f})" if f.get("cvss") is not None else ""
+            line(6, f"[{f['id']}] {f['title']}{cvss_tag} - {f['status']}")
+            pdf.set_font("Helvetica", "", 10)
+            line(6, f["description"])
+            if f.get("evidence"):
+                pdf.set_font("Helvetica", "I", 9)
+                line(6, f"Evidence: {f['evidence']}")
+            pdf.ln(2)
+
+    resolved = [f for f in items if f["status"] in ("fixed", "false_positive")]
+    if resolved:
+        pdf.set_font("Helvetica", "B", 13)
+        line(8, "Resolved")
+        pdf.set_font("Helvetica", "", 10)
+        for f in resolved:
+            line(6, f"[{f['id']}] ({f['severity']}, {f['status']}) {f['title']}")
+
+    out_dir = WORKDIR / "reports"
+    out_dir.mkdir(exist_ok=True)
+    out_path = out_dir / f"{project}_{now.strftime('%Y%m%d_%H%M%S')}.pdf"
+    pdf.output(str(out_path))
+    return f"wrote PDF report to {out_path.relative_to(WORKDIR)}"
 
 
 # ---------- CTF flags ----------
@@ -495,6 +658,63 @@ def audit(tool_name: str, args: dict, outcome: str) -> None:
         fh.write(json.dumps(entry) + "\n")
 
 
+# ---------- credentials (authenticated testing) ----------
+def load_credentials() -> list[dict]:
+    try:
+        return json.loads(CREDENTIALS_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def save_credentials(items: list[dict]) -> None:
+    CREDENTIALS_FILE.write_text(json.dumps(items, indent=2))
+
+
+def add_credential(args: dict) -> str:
+    items = load_credentials()
+    items.append(
+        {
+            "id": max((c["id"] for c in items), default=0) + 1,
+            "project": args["project"],
+            "label": args["label"],
+            "username": args.get("username", ""),
+            "secret": args["secret"],
+            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+    )
+    save_credentials(items)
+    # Never echo the secret back, even in the tool's own result.
+    return f"stored credential '{args['label']}' for project '{args['project']}'"
+
+
+def list_credentials(project: str | None) -> str:
+    items = load_credentials()
+    if project:
+        items = [c for c in items if c["project"] == project]
+    if not items:
+        return "no credentials stored"
+    # Labels and usernames only — never the secret. Use get_credential to
+    # retrieve one for actual use.
+    return "\n".join(
+        f"[{c['id']}] {c['project']} / {c['label']}" + (f" ({c['username']})" if c.get("username") else "")
+        for c in items
+    )
+
+
+def get_credential(cred_id: int) -> str:
+    for c in load_credentials():
+        if c["id"] == cred_id:
+            return f"username: {c.get('username', '')}\nsecret: {c['secret']}"
+    return "no such credential id"
+
+
+def remove_credential(cred_id: int) -> str:
+    items = load_credentials()
+    kept = [c for c in items if c["id"] != cred_id]
+    save_credentials(kept)
+    return "removed" if len(kept) < len(items) else "no such credential id"
+
+
 # ---------- source review ----------
 def list_dir(rel: str) -> str:
     p = safe_path(rel)
@@ -513,6 +733,153 @@ def search_code(pattern: str, rel: str) -> str:
     )
     out = r.stdout.replace(str(WORKDIR) + "/", "")  # show paths relative to workspace
     return out[:20000] or "no matches"
+
+
+# ---------- scanners ----------
+def _tool_installed(name: str) -> bool:
+    return subprocess.run(["which", name], capture_output=True).returncode == 0
+
+
+def scan_dependencies(project: str, rel: str) -> str:
+    """Run npm audit or pip-audit against a workspace path and log findings
+    for anything medium severity or above — no freeform interpretation, the
+    severities and CVE ids come straight from the tool's own JSON output."""
+    p = safe_path(rel)
+    if not p.is_dir():
+        return f"error: {rel} is not a directory"
+
+    logged = []
+    if (p / "package.json").exists():
+        if not _tool_installed("npm"):
+            return "error: npm is not installed, can't run npm audit"
+        r = subprocess.run(
+            ["npm", "audit", "--json"], cwd=p, capture_output=True, text=True, timeout=120
+        )
+        try:
+            data = json.loads(r.stdout or "{}")
+        except json.JSONDecodeError:
+            return f"error: couldn't parse npm audit output: {r.stdout[:500]}"
+        vulns = data.get("vulnerabilities", {})
+        if not vulns:
+            return "npm audit: no vulnerabilities found"
+        for pkg_name, v in vulns.items():
+            severity = v.get("severity", "info")
+            severity = {"moderate": "medium", "critical": "critical", "high": "high", "low": "low"}.get(severity, "info")
+            if severity in ("critical", "high", "medium"):
+                via = v.get("via", [])
+                names = {x.get("title", str(x)) if isinstance(x, dict) else str(x) for x in via}
+                add_finding({
+                    "project": project,
+                    "title": f"Vulnerable dependency: {pkg_name}",
+                    "severity": severity,
+                    "description": f"npm audit flagged {pkg_name}: " + "; ".join(names)[:500],
+                    "evidence": f"npm audit --json ({rel}/package.json)",
+                })
+                logged.append(pkg_name)
+        return f"npm audit: logged {len(logged)} finding(s) for {', '.join(logged) or '(none above medium)'}"
+
+    if (p / "requirements.txt").exists():
+        if not _tool_installed("pip-audit"):
+            return "error: pip-audit is not installed (pip install pip-audit), can't scan requirements.txt"
+        r = subprocess.run(
+            ["pip-audit", "-r", str(p / "requirements.txt"), "--format", "json"],
+            capture_output=True, text=True, timeout=180,
+        )
+        try:
+            data = json.loads(r.stdout or "[]")
+        except json.JSONDecodeError:
+            return f"error: couldn't parse pip-audit output: {r.stdout[:500]}"
+        deps = data if isinstance(data, list) else data.get("dependencies", [])
+        for dep in deps:
+            for vuln in dep.get("vulns", []):
+                add_finding({
+                    "project": project,
+                    "title": f"Vulnerable dependency: {dep.get('name')} {dep.get('version', '')}",
+                    "severity": "high",  # pip-audit doesn't give a severity tier; treat any hit as high
+                    "description": f"{vuln.get('id', 'unknown CVE')}: {vuln.get('description', '')[:400]}",
+                    "evidence": "pip-audit --format json",
+                })
+                logged.append(dep.get("name"))
+        return f"pip-audit: logged {len(logged)} finding(s)" if logged else "pip-audit: no vulnerabilities found"
+
+    return f"error: no package.json or requirements.txt found under {rel}"
+
+
+# Fallback secret patterns, used when gitleaks isn't installed. Not as
+# thorough as gitleaks — a quick net for the obvious, common cases.
+_SECRET_PATTERNS = [
+    ("AWS Access Key", r"AKIA[0-9A-Z]{16}"),
+    ("Generic API key assignment", r"(?i)(api[_-]?key|secret[_-]?key|access[_-]?token)\s*[=:]\s*['\"][A-Za-z0-9_\-/+=]{16,}['\"]"),
+    ("Private key block", r"-----BEGIN (RSA |EC |OPENSSH |)PRIVATE KEY-----"),
+    ("Slack token", r"xox[baprs]-[0-9A-Za-z-]{10,}"),
+    ("Google API key", r"AIza[0-9A-Za-z_\-]{35}"),
+    ("JWT", r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
+]
+
+
+def _redact(value: str) -> str:
+    if len(value) <= 8:
+        return "*" * len(value)
+    return value[:4] + "*" * (len(value) - 8) + value[-4:]
+
+
+def scan_secrets(project: str, rel: str) -> str:
+    """gitleaks if installed, otherwise a regex fallback over text files.
+    Logs a finding per match with the secret value redacted — the finding
+    records that something was found and where, never the full secret."""
+    p = safe_path(rel)
+    if not p.exists():
+        return f"error: {rel} does not exist"
+
+    if _tool_installed("gitleaks"):
+        r = subprocess.run(
+            ["gitleaks", "detect", "--source", str(p), "--no-git", "--report-format", "json", "--report-path", "/dev/stdout", "--exit-code", "0"],
+            capture_output=True, text=True, timeout=120,
+        )
+        try:
+            findings = json.loads(r.stdout or "[]")
+        except json.JSONDecodeError:
+            findings = []
+        logged = 0
+        for f in findings:
+            add_finding({
+                "project": project,
+                "title": f"Secret detected: {f.get('RuleID', 'unknown rule')}",
+                "severity": "critical",
+                "description": f"gitleaks matched rule '{f.get('RuleID')}' in {f.get('File')}",
+                "evidence": f"{f.get('File')}:{f.get('StartLine')} — {_redact(f.get('Secret', ''))}",
+            })
+            logged += 1
+        return f"gitleaks: logged {logged} finding(s)"
+
+    # Fallback: walk text files under a size cap, skip obvious binaries.
+    logged = 0
+    scanned = 0
+    for path in p.rglob("*"):
+        if not path.is_file() or path.stat().st_size > 2_000_000:
+            continue
+        try:
+            text = path.read_text(errors="ignore")
+        except (UnicodeDecodeError, OSError):
+            continue
+        scanned += 1
+        for label, pattern in _SECRET_PATTERNS:
+            for m in re.finditer(pattern, text):
+                line_no = text.count("\n", 0, m.start()) + 1
+                rel_file = path.relative_to(WORKDIR)
+                add_finding({
+                    "project": project,
+                    "title": f"Possible secret: {label}",
+                    "severity": "high",
+                    "description": (
+                        f"Pattern match for '{label}' — gitleaks isn't installed, this is a "
+                        "regex fallback, so verify manually before treating as confirmed."
+                    ),
+                    "evidence": f"{rel_file}:{line_no} — {_redact(m.group(0))}",
+                })
+                logged += 1
+    return f"regex fallback (gitleaks not installed): scanned {scanned} file(s), logged {logged} finding(s)"
+
 
 TOOLS = [
     {
@@ -623,6 +990,7 @@ TOOLS = [
                 "severity": {"type": "string", "enum": list(SEVERITIES)},
                 "description": {"type": "string"},
                 "evidence": {"type": "string", "description": "file:line, snippet, or command output that supports this"},
+                "cvss": {"type": "number", "description": "Optional CVSS base score (0.0-10.0) for extra rigor alongside severity"},
             },
             "required": ["project", "title", "severity", "description"],
         },
@@ -655,9 +1023,23 @@ TOOLS = [
         "name": "generate_report",
         "description": (
             "Build a markdown report for a project from its logged findings "
-            "(findings.json), written to workspace/reports/. The report is "
+            "(findings.json), written to workspace/reports/. Includes a "
+            "templated executive summary and CVSS stats. The report is "
             "assembled directly from findings data, not drafted freely, so "
             "it only ever states what's actually been logged."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"project": {"type": "string"}},
+            "required": ["project"],
+        },
+    },
+    {
+        "name": "export_report_pdf",
+        "description": (
+            "Build a PDF report for a project, same content/source-of-truth "
+            "as generate_report (findings.json), for handing to someone else "
+            "or keeping with a release. Requires fpdf2."
         ),
         "input_schema": {
             "type": "object",
@@ -750,6 +1132,87 @@ TOOLS = [
         "description": "List targets currently in the authorized-testing scope.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
+    {
+        "name": "scan_dependencies",
+        "description": (
+            "Run npm audit (package.json) or pip-audit (requirements.txt) "
+            "against a workspace path and auto-log a finding per vulnerable "
+            "dependency at medium severity or above. Severities/CVE ids come "
+            "from the tool's own output, not interpreted freely."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string"},
+                "path": {"type": "string", "description": "Relative workspace path containing package.json or requirements.txt"},
+            },
+            "required": ["project", "path"],
+        },
+    },
+    {
+        "name": "scan_secrets",
+        "description": (
+            "Scan a workspace path for hardcoded secrets. Uses gitleaks if "
+            "installed, otherwise a built-in regex fallback (less thorough — "
+            "flag for manual verification). Auto-logs a finding per match "
+            "with the secret value redacted."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string"},
+                "path": {"type": "string", "description": "Relative workspace path to scan"},
+            },
+            "required": ["project", "path"],
+        },
+    },
+    {
+        "name": "add_credential",
+        "description": (
+            "Store a test account's credentials for authenticated testing "
+            "(e.g. two accounts for IDOR checks). Only ever use your own "
+            "test accounts, never a real user's. The secret is never echoed "
+            "back or shown in list_credentials — use get_credential to "
+            "retrieve it when actually needed."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string"},
+                "label": {"type": "string", "description": "e.g. 'parent account A', 'admin test user'"},
+                "username": {"type": "string"},
+                "secret": {"type": "string", "description": "password, token, or API key"},
+            },
+            "required": ["project", "label", "secret"],
+        },
+    },
+    {
+        "name": "list_credentials",
+        "description": "List stored credential labels/usernames for a project (never the secret itself).",
+        "input_schema": {
+            "type": "object",
+            "properties": {"project": {"type": "string"}},
+            "required": [],
+        },
+    },
+    {
+        "name": "get_credential",
+        "description": "Retrieve a stored credential's username and secret by id, for actual use in a test.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"id": {"type": "integer"}},
+            "required": ["id"],
+        },
+    },
+    {
+        "name": "remove_credential",
+        "description": "Delete a stored credential by id.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"id": {"type": "integer"}},
+            "required": ["id"],
+        },
+    },
 ]
 
 
@@ -769,15 +1232,22 @@ def _scope_block_message(out_of_scope: set[str]) -> str:
     )
 
 
+_CREDENTIAL_TOOLS = {"add_credential", "get_credential"}
+
+
 def run_tool(name: str, args: dict) -> str:
     """Dispatches a tool call, checking scope on network-facing tools first,
     and logs every call (name, args, result) to the audit log regardless of
-    outcome."""
+    outcome. Credential secrets are redacted before anything is written to
+    the log — the real tool result is still returned to the caller."""
     try:
         result = _dispatch_tool(name, args)
     except Exception as e:  # return errors to the model so it can recover
         result = f"error: {e}"
-    audit(name, args, result)
+    if name in _CREDENTIAL_TOOLS:
+        audit(name, {**args, "secret": "<redacted>"} if "secret" in args else args, "<redacted>")
+    else:
+        audit(name, args, result)
     return result
 
 
@@ -824,6 +1294,20 @@ def _dispatch_tool(name: str, args: dict) -> str:
         return list_findings(args)
     if name == "generate_report":
         return generate_report(args["project"])
+    if name == "export_report_pdf":
+        return export_report_pdf(args["project"])
+    if name == "scan_dependencies":
+        return scan_dependencies(args["project"], args["path"])
+    if name == "scan_secrets":
+        return scan_secrets(args["project"], args["path"])
+    if name == "add_credential":
+        return add_credential(args)
+    if name == "list_credentials":
+        return list_credentials(args.get("project"))
+    if name == "get_credential":
+        return get_credential(args["id"])
+    if name == "remove_credential":
+        return remove_credential(args["id"])
     if name == "submit_flag":
         return submit_flag(args)
     if name == "list_flags":
@@ -854,13 +1338,63 @@ def _dispatch_tool(name: str, args: dict) -> str:
     return f"unknown tool: {name}"
 
 
+# ---------- resilience ----------
+_RETRYABLE_STATUS = {429, 500, 502, 503, 529}  # rate limit, server error, overloaded
+
+
+def _call_with_retries(client: anthropic.Anthropic, max_retries: int = 5, **kwargs):
+    """Exponential backoff on transient API errors (rate limit, connection
+    drop, server overload). A 4xx that isn't a rate limit is a real problem
+    with the request, not something retrying fixes, so that's raised as-is."""
+    delay = 1.0
+    last_err = None
+    for attempt in range(max_retries + 1):
+        try:
+            return client.messages.create(**kwargs)
+        except (anthropic.RateLimitError, anthropic.APIConnectionError) as e:
+            last_err = e
+        except anthropic.APIStatusError as e:
+            if getattr(e, "status_code", None) not in _RETRYABLE_STATUS:
+                raise
+            last_err = e
+        if attempt == max_retries:
+            raise last_err
+        print(f"  [API error, retrying in {delay:.0f}s: {last_err}]")
+        time.sleep(delay)
+        delay = min(delay * 2, 30)
+
+
+def _serialize_content(content) -> list:
+    return [b.model_dump() if hasattr(b, "model_dump") else b for b in content]
+
+
+def save_history(messages: list) -> None:
+    """Persisted after every step so a crash mid-run (long pentest passes are
+    exactly where that's likely) doesn't lose the conversation — resume with
+    BLAQS_RESUME=1."""
+    serializable = [
+        m if isinstance(m["content"], str) else {"role": m["role"], "content": _serialize_content(m["content"])}
+        for m in messages
+    ]
+    HISTORY_FILE.write_text(json.dumps(serializable, indent=2))
+
+
+def load_history() -> list:
+    try:
+        return json.loads(HISTORY_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
 def run_agent(task: str, history: list | None = None) -> list:
     client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from the environment
     messages = history or []
     messages.append({"role": "user", "content": task})
+    save_history(messages)
 
     for _ in range(MAX_STEPS):
-        resp = client.messages.create(
+        resp = _call_with_retries(
+            client,
             model=MODEL,
             max_tokens=2048,
             system=build_system_prompt(),  # rebuilt each step so new memories apply
@@ -868,6 +1402,7 @@ def run_agent(task: str, history: list | None = None) -> list:
             messages=messages,
         )
         messages.append({"role": "assistant", "content": resp.content})
+        save_history(messages)
 
         for block in resp.content:
             if block.type == "text" and block.text.strip():
@@ -888,6 +1423,7 @@ def run_agent(task: str, history: list | None = None) -> list:
                     }
                 )
         messages.append({"role": "user", "content": results})
+        save_history(messages)
 
     print("\n[stopped: reached MAX_STEPS]")
     return messages
@@ -896,9 +1432,22 @@ def run_agent(task: str, history: list | None = None) -> list:
 if __name__ == "__main__":
     print("BlaqsAI ready. Type a task, or 'exit' to quit.")
     history: list = []
+    if os.environ.get("BLAQS_RESUME") == "1":
+        history = load_history()
+        if history:
+            print(f"Resumed {len(history)} prior message(s) from {HISTORY_FILE.name}.")
     while True:
-        task = input("\nYou: ").strip()
+        try:
+            task = input("\nYou: ").strip()
+        except EOFError:
+            break
         if task.lower() in {"exit", "quit"}:
             break
-        if task:
+        if not task:
+            continue
+        try:
             history = run_agent(task, history)
+        except Exception as e:
+            # A crash mid-task shouldn't take down the whole session — the
+            # history up to the last completed step is already on disk.
+            print(f"\n[error: {e}] — history saved, you can retry or BLAQS_RESUME=1 to continue later.")

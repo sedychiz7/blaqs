@@ -4,6 +4,8 @@ findings.json
 ctf_flags.json
 scope.json
 audit.log
+credentials.json
+history.json
 .env
 __pycache__/
 *.pyc

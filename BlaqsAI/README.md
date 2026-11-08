@@ -14,6 +14,10 @@ A minimal AI agent: an LLM in a loop with tools.
 - `submit_flag` / `list_flags`: for CTF/lab boxes specifically — a one-shot capture, not an ongoing tracked review, so it's a separate log (`ctf_flags.json`) from findings. Rejects a flag already recorded for the same challenge.
 - `binary_info`: fast triage on a binary in the workspace — `file`, `checksec` (if installed), and readable `strings` — before deciding whether to disassemble or debug further.
 - `add_scope_target` / `remove_scope_target` / `list_scope`: the authorized-testing scope, saved to `scope.json`. **Enforced in code**, not just a prompt instruction — `run_command`, `fetch_url`, and `download_file` are blocked if the command/URL references a host/IP that isn't in scope and scope isn't empty.
+- `scan_dependencies`: runs `npm audit` (package.json) or `pip-audit` (requirements.txt) against a workspace path and auto-logs a finding per vulnerable dependency at medium severity or above — severities and descriptions come straight from the scanner's own JSON, not interpreted freely.
+- `scan_secrets`: uses `gitleaks` if installed, otherwise a built-in regex fallback (AWS keys, generic API key assignments, private key blocks, Slack tokens, Google API keys, JWTs) over text files. Auto-logs a finding per match with the secret **redacted** (first/last 4 chars only) — the fallback is explicitly flagged as less thorough than gitleaks in each finding's description, so it reads as "verify this" rather than "confirmed."
+- `add_credential` / `list_credentials` / `get_credential` / `remove_credential`: stored test-account credentials for authenticated testing (IDOR/permission checks across accounts), saved to `credentials.json`. The secret is **never** echoed in `list_credentials` or written to `audit.log` in plaintext (both are redacted at the point of logging) — only `get_credential`'s direct return carries the real value, for the one call that actually needs it. For your own test accounts only, never a real user's.
+- `export_report_pdf`: same source of truth as `generate_report` (`findings.json`, not a re-parse of the markdown) — a PDF with an executive summary, CVSS stats, and the same severity grouping. Requires `fpdf2`.
 
 ## Source review workflow
 To review one of your own apps (SchoolRun, FIF Finder, etc.) rather than scan a
@@ -22,11 +26,19 @@ running target:
 2. `list_dir` / `search_code` to map structure and spot patterns worth a closer
    look (auth checks, hardcoded secrets, string-built SQL, unsanitized input).
 3. `read_file` on what those point at.
-4. `add_finding` for anything real, with file:line evidence.
-5. `list_findings` before a repeat pass, so old findings aren't re-logged and you
+4. `add_finding` for anything real, with file:line evidence. Add a `cvss` score
+   (0.0-10.0) if you have a real basis for one — optional, severity still drives
+   the report either way.
+5. `scan_dependencies` and `scan_secrets` early in the pass — they log findings
+   straight from the underlying tool's output, more reliable than eyeballing a
+   lockfile or grepping for keys by hand.
+6. For anything that needs a logged-in user (IDOR, permission checks across
+   accounts), `add_credential` your own test accounts first, then `get_credential`
+   when a test actually needs the value.
+7. `list_findings` before a repeat pass, so old findings aren't re-logged and you
    can check whether they still reproduce.
-6. `generate_report` for a project when you want a writeup — one markdown file,
-   severity-grouped, in `workspace/reports/`.
+8. `generate_report` (markdown) or `export_report_pdf` (PDF, for handing to
+   someone else or keeping with a release) when you want a writeup.
 
 ## Running it on Kali
 Install BlaqsAI directly on your Kali box (rather than running it elsewhere and
@@ -56,24 +68,6 @@ pip install -r requirements.txt
 export ANTHROPIC_API_KEY=your-key-here
 python agent.py
 ```
-
-## Using your Kali machine
-`run_kali_command` reaches Kali over plain `ssh` — it stores no password or key itself,
-it just reuses whatever SSH access you already have set up.
-
-1. Make sure you can already run `ssh kali-user@kali-ip` from wherever BlaqsAI runs,
-   ideally with a key (`ssh-copy-id kali-user@kali-ip`) so it doesn't need `BatchMode`
-   to fall back to a password prompt it can't answer.
-2. Set the host before starting the agent:
-   ```bash
-   export BLAQS_KALI_HOST=kali-user@kali-ip
-   # export BLAQS_KALI_PORT=22   # only if not the default
-   ```
-3. Tell the agent which target(s) you're authorized to test (e.g. your own lab,
-   or a specific Hack The Box machine) — the system prompt reminds it to stick to
-   targets you've actually named.
-
-Leave `BLAQS_KALI_HOST` unset to disable the tool entirely.
 
 ## Mobile app (APK/IPA) review workflow
 Different shape from a web app or source repo — no running server to scan, no
@@ -125,15 +119,32 @@ review:
   way for the model to skip it, since logging happens in `run_tool` around
   every dispatch.
 
+## Resilience
+- API calls retry with exponential backoff on rate limits, connection drops,
+  and server overload (429/500/502/503/529) — up to 5 attempts. A real error
+  with the request itself (bad input, auth failure) raises immediately rather
+  than retrying something retrying can't fix.
+- The conversation is written to `history.json` after every step, not just at
+  the end — a crash mid-pentest-pass doesn't lose what came before it. Resume
+  with `BLAQS_RESUME=1 python agent.py`.
+- A crash inside one task no longer kills the whole session — the REPL catches
+  it, tells you, and lets you keep going (history up to the last completed
+  step is already saved).
+
+**What this is not**: true multi-target concurrency (several targets scanned
+in parallel). Findings/credentials/scope are namespaced by project, so you can
+work multiple targets *in the same session* without their data mixing — but
+everything still runs one step at a time. Real parallelism would mean either
+file locking or a real database instead of flat JSON files, since concurrent
+writers to the same JSON file will corrupt it; that's a bigger change than
+this round, not something to fake.
+
 ## Safety
 - Step limit (`BLAQS_MAX_STEPS`, default 50) stops runaway loops but gives a real test pass room to enumerate, try things, and adjust
 - File access can't escape `workspace/`
 - Commands need a `y` from you — every time, no "approve all" — and are scope-checked before you're even asked
 
 ## Next ideas
-- Dependency/secret scanner integration (npm audit, pip-audit, gitleaks) as first-class tools instead of ad-hoc shell calls
-- Authenticated-testing scaffolding (stored test credentials, multi-account/IDOR checks)
-- Multi-target/concurrency support and more resilient error handling
-- A real report deliverable: PDF export, executive summary, CVSS-style scoring
+- Real multi-target concurrency (would need file locking or a proper database, not flat JSON)
 - Background jobs for long scans, with polling instead of a blocking timeout
 - Telegram or WhatsApp front end
